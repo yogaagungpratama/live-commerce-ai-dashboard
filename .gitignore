@@ -1,0 +1,6 @@
+.env
+*.secret
+__pycache__/
+*.pyc
+data/
+*.bak-*
