@@ -1,7 +1,7 @@
 import os, json, re, csv, io, math
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 import psycopg
 from psycopg.rows import dict_row
@@ -142,6 +142,88 @@ def analyze():
       'survey':survey_stats(surveys),
       'timeline':[{'t':k.isoformat(),**v} for k,v in sorted(tl.items())],'has_dummy':has_dummy,
       'updated':datetime.now(timezone.utc).isoformat()}
+# ---------- Akun live, Copilot, Overlay (tulis hanya dari origin yang sama)
+UNAME=re.compile(r'^[A-Za-z0-9._]{2,24}$')
+def cfg_get(c,k,d=None):
+    r=c.execute('SELECT value FROM live_config WHERE key=%s',(k,)).fetchone(); return (r or {}).get('value') or d
+def cfg_set(c,k,v): c.execute("INSERT INTO live_config(key,value,updated_at) VALUES(%s,%s,now()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()",(k,json.dumps(v)))
+@app.on_event('startup')
+def _init():
+    try:
+        with db() as c: c.execute("CREATE TABLE IF NOT EXISTS live_config(key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+    except Exception as e: print('live_config init deferred:',e)
+def same_origin(req:Request):
+    o=req.headers.get('origin') or req.headers.get('referer') or ''
+    if req.headers.get('x-requested-with')!='liveai' or (o and req.headers.get('host','') not in o): raise HTTPException(403,'forbidden')
+@app.get('/api/live/config')
+def live_cfg():
+    with db() as c: return {'tiktok':cfg_get(c,'tiktok',{}),'tiktok_status':cfg_get(c,'tiktok_status',{}),'shopee':cfg_get(c,'shopee',{})}
+@app.post('/api/live/config')
+async def live_cfg_set(req:Request):
+    same_origin(req); b=await req.json(); plat=b.get('platform'); u=str(b.get('username') or '').strip().lstrip('@')
+    if plat not in ('tiktok','shopee') or (u and not UNAME.match(u)): raise HTTPException(400,'username tidak valid')
+    with db() as c: cfg_set(c,plat,{'username':u,'enabled':bool(b.get('enabled')) and bool(u)})
+    return live_cfg()
+INTENTS=[('harga',['harga','berapa','price']),('stok',['ready','stok','stock','ada gak','masih']),('ukuran',['size','ukuran','xl',' l ',' m ']),
+  ('warna',['warna','color','hitam','putih','navy']),('cod',['cod','bayar']),('promo',['promo','diskon','voucher']),('rekomendasi',['cari','rekomendasi','budget','cocok','bagus buat'])]
+def _intent(low): return next((k for k,ws in INTENTS if any(w in f' {low} ' for w in ws)),None)
+def _rp(v): return 'Rp '+f'{int(v):,}'.replace(',','.') if v is not None else '-'
+def copilot_items(limit=25):
+    with db() as c:
+        rows=c.execute("SELECT platform,payload,created_at FROM events WHERE event_type IN ('comment','chat','message') ORDER BY id DESC LIMIT 300").fetchall()
+        prods=c.execute('SELECT name,price::float AS price,tags,description,stock FROM product_catalog').fetchall()
+    out=[]
+    for r in rows:
+        p=r['payload'] or {}; cm=safe_text(p.get('comment') or p.get('message') or p.get('text')); low=cm.lower(); it=_intent(low)
+        if not it: continue
+        nick=p.get('nickname') or p.get('username') or 'kak'
+        prod=next((x for x in prods if x['name'].lower() in low),None); reasons=[]
+        if not prod:
+            m=re.search(r'(?:budget|harga|di bawah|under)\s*(?:rp)?\s*([0-9][0-9.,]*)',low); bud=float(re.sub(r'[.,]','',m.group(1))) if m else None
+            best=(0,None)
+            for x in prods:
+                sc=sum(2 for t in (x['tags'] or []) if t!='dummy' and t in low)+(2 if bud and x['price'] and x['price']<=bud else 0)
+                if sc>best[0]: best=(sc,x)
+            prod=best[1]
+            if prod:
+                reasons=[f'Kata kunci cocok: {t}' for t in (prod['tags'] or []) if t!='dummy' and t in low]+([f'Harga {_rp(prod["price"])} sesuai budget {_rp(bud)}'] if bud and prod['price'] and prod['price']<=bud else [])
+        n=f'Kak {nick}'; pn=prod['name'] if prod else 'produknya'
+        d={'harga':f"{n}, {pn} harganya {_rp(prod['price']) if prod else 'ada di keranjang kuning'} ya.",
+           'stok':f"{n}, {pn} stoknya {prod['stock'] if prod else 'bisa dicek di keranjang'} ya, langsung checkout aja.",
+           'ukuran':f"{n}, ukuran {pn} bisa dicek di pilihan varian; sebutkan ukuran yang dicari, nanti kami bantu cek.",
+           'warna':f"{n}, warna {pn} bisa dilihat di pilihan varian ya.",
+           'cod':f"{n}, metode COD mengikuti ketersediaan di halaman checkout ya.",
+           'promo':f"{n}, cek voucher toko di keranjang kuning sebelum checkout ya.",
+           'rekomendasi':(f"{n}, rekomendasi kami {pn} ({_rp(prod['price'])}). Alasannya: "+'; '.join(reasons or ['sesuai kebutuhan yang disebut'])+'. (Rekomendasi dibantu AI)') if prod else f"{n}, boleh sebutkan kebutuhan dan budgetnya?"}[it]
+        out.append({'platform':r['platform'],'user':nick,'comment':cm,'time':r['created_at'].isoformat(),'intent':it,'draft':d,
+          'product':({'name':prod['name'],'price':prod['price'],'stock':prod['stock'],'desc':safe_text(prod['description']).replace('[DUMMY] ','')} if prod else None),'reasons':reasons})
+        if len(out)>=limit: break
+    return out
+@app.get('/api/copilot')
+def copilot(): return JSONResponse(copilot_items())
+@app.get('/api/overlay')
+def overlay_get():
+    with db() as c: return cfg_get(c,'overlay',{'visible':False})
+@app.post('/api/overlay')
+async def overlay_set(req:Request):
+    same_origin(req); b=await req.json(); pr=b.get('product') or {}
+    v={'visible':bool(b.get('visible')),'product':{'name':safe_text(pr.get('name'))[:80],'price':pr.get('price') if isinstance(pr.get('price'),(int,float)) else None,'desc':safe_text(pr.get('desc'))[:160]},
+       'reasons':[safe_text(x)[:120] for x in (b.get('reasons') or [])][:4]}
+    with db() as c: cfg_set(c,'overlay',v)
+    return v
+@app.get('/overlay',response_class=HTMLResponse)
+def overlay_page(): return HTMLResponse(OVERLAY)
+OVERLAY=r"""<!doctype html><html><head><meta charset="utf-8"><title>Overlay</title><style>
+html,body{margin:0;background:transparent;font-family:Inter,system-ui,Segoe UI,Arial}#c{position:fixed;left:24px;bottom:24px;width:420px;opacity:0;transform:translateY(20px);transition:.4s}
+#c.on{opacity:1;transform:none}.k{background:linear-gradient(160deg,#2a1b6bee,#160f38ee);color:#fff;border:1px solid #7c3aed;border-radius:18px;padding:16px;box-shadow:0 10px 40px #0008}
+.ai{display:inline-block;background:#7c3aed;border-radius:20px;padding:3px 10px;font-size:12px;font-weight:700;margin-bottom:8px}.n{font-size:22px;font-weight:800}.p{color:#5eead4;font-size:20px;font-weight:800;margin:2px 0 6px}
+.d{color:#d6d3ff;font-size:13px;margin-bottom:8px}ul{margin:0;padding-left:18px;font-size:14px}li{margin:3px 0}.w{font-size:12px;color:#c4b5fd;margin-bottom:4px;font-weight:700}</style></head><body>
+<div id="c"><div class="k"><span class="ai">✦ Rekomendasi dibantu AI</span><div class="n" id="n"></div><div class="p" id="p"></div><div class="d" id="d"></div><div class="w">Kenapa direkomendasikan?</div><ul id="r"></ul></div></div>
+<script>const e=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function t(){try{const v=await (await fetch('api/overlay',{cache:'no-store'})).json();const c=document.getElementById('c');if(!v.visible){c.className='';return}
+document.getElementById('n').textContent=v.product.name;document.getElementById('p').textContent=v.product.price!=null?'Rp '+Math.round(v.product.price).toLocaleString('id-ID'):'';
+document.getElementById('d').textContent=v.product.desc||'';document.getElementById('r').innerHTML=(v.reasons.length?v.reasons:['Sesuai komentar penonton']).map(x=>'<li>'+e(x)+'</li>').join('');c.className='on'}catch(_){}}
+t();setInterval(t,2000)</script></body></html>"""
 @app.get('/api/survey.csv')
 def survey_csv():
     with db() as c:
@@ -213,7 +295,7 @@ table{width:100%;border-collapse:collapse}th{color:#d6d3ff;font-weight:600;font-
 input,select{background:#0d0a24;color:var(--txt);border:1px solid var(--line);padding:9px 11px;border-radius:9px}
 .btn{background:linear-gradient(180deg,#8b5cf6,#7c3aed);color:#fff;border:0;border-radius:9px;padding:9px 14px}.btn.g{background:#ffffff10;border:1px solid var(--line)}
 .s{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.s.positive{background:var(--green)}.s.negative{background:var(--red)}.s.neutral{background:#94a3b8}
-.donutwrap{display:flex;gap:20px;align-items:center;flex-wrap:wrap}.empty{color:var(--muted);padding:8px 0}
+.chip{display:inline-block;padding:2px 8px;border-radius:7px;background:#7c3aed33;color:#ddd6fe;font-size:12px}.donutwrap{display:flex;gap:20px;align-items:center;flex-wrap:wrap}.empty{color:var(--muted);padding:8px 0}
 .set{display:grid;grid-template-columns:220px 1fr;gap:12px 20px;align-items:center}@media(max-width:760px){.set{grid-template-columns:1fr}}
 .lang{display:flex;border:1px solid var(--line);border-radius:10px;overflow:hidden}.lang button{background:none;border:0;color:var(--muted);padding:7px 10px;font-weight:700;font-size:12px}.lang button.on{background:var(--pur2);color:#fff}
 footer{padding:18px 3vw 26px;color:var(--muted);font-size:12px;text-align:center}
@@ -224,6 +306,7 @@ footer{padding:18px 3vw 26px;color:var(--muted);font-size:12px;text-align:center
 <a href="#live" data-v="live"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M8 8a6 6 0 000 8M16 8a6 6 0 010 8M5 5a10 10 0 000 14M19 5a10 10 0 010 14"/></svg><span data-i="nav_live"></span></a>
 <a href="#products" data-v="products"><svg viewBox="0 0 24 24"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg><span data-i="nav_products"></span></a>
 <a href="#insights" data-v="insights"><svg viewBox="0 0 24 24"><path d="M12 3l1.8 4.7L18.5 9.5l-4.7 1.8L12 16l-1.8-4.7L5.5 9.5l4.7-1.8zM19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg><span data-i="nav_insights"></span></a>
+<a href="#copilot" data-v="copilot"><svg viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/><path d="M8 10h8"/></svg><span data-i="nav_copilot"></span></a>
 <a href="#research" data-v="research"><svg viewBox="0 0 24 24"><path d="M9 3h6M10 3v6l-5 9a2 2 0 002 3h10a2 2 0 002-3l-5-9V3"/></svg><span data-i="nav_research"></span></a>
 <div class="dd" id="dd"><button onclick="toggleDD(event)"><svg viewBox="0 0 24 24"><path d="M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2M12 4v12M7 11l5 5 5-5"/></svg>Data ▾</button><div class="list"><button onclick="downloadJSON()">Export JSON</button><button onclick="downloadCSV()" data-i="exp_comments"></button><button onclick="downloadProducts()" data-i="exp_products"></button><a href="#" onclick="openResearch();return false" data-i="open_mvp"></a></div></div>
 <a href="#settings" data-v="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg><span data-i="nav_settings"></span></a>
@@ -253,6 +336,10 @@ footer{padding:18px 3vw 26px;color:var(--muted);font-size:12px;text-align:center
 <div class="g2"><div class="card"><h2 data-i="sent_mix"></h2><div id="sentDonut"></div><p class="muted small" data-i="heuristic"></p></div><div class="card"><h2 data-i="keywords"></h2><div id="keywords"></div></div></div>
 <div class="g2"><div class="card"><h2 data-i="faq"></h2><div id="questions"></div></div><div class="card"><h2 data-i="event_types"></h2><div id="eventtypes"></div></div></div></section>
 
+<section class="view" id="v-copilot"><div class="head"><h1 data-i="nav_copilot"></h1><p data-i="cp_sub"></p></div>
+<div class="g2" style="margin-top:0"><div class="card"><h2 data-i="cp_conn"></h2><div id="cpstatus" class="muted">-</div><p class="small muted" data-i="cp_readonly"></p></div>
+<div class="card"><h2 data-i="cp_ovl"></h2><p class="small muted" data-i="cp_ovl_help"></p><div class="tools"><input id="ovlurl" readonly style="flex:1;min-width:220px"><button class="btn g" onclick="copyText($('ovlurl').value)" data-i="copy"></button><button class="btn g" onclick="hideOverlay()" data-i="cp_hide"></button></div><div id="ovlnow" class="small muted"></div></div></div>
+<div class="card" style="margin-top:14px"><h2 data-i="cp_queue"></h2><div class="feed" id="cplist"></div></div></section>
 <section class="view" id="v-research"><div class="head"><h1 data-i="nav_research"></h1><p data-i="res_sub"></p></div>
 <div class="tiles" id="rmon2" style="grid-template-columns:repeat(4,1fr)"></div>
 <div class="card" style="margin-top:14px"><h2><span class="l" data-i="sv_title"></span><span style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" onclick="openSurvey()" data-i="sv_open"></button><a class="btn g" href="api/survey.csv" data-i="sv_csv"></a></span></h2><div id="svbox"></div></div>
@@ -267,6 +354,11 @@ footer{padding:18px 3vw 26px;color:var(--muted);font-size:12px;text-align:center
 <label data-i="set_port"></label><input id="setPort" type="number" min="1" max="65535" onchange="saveSet()">
 <label>Data</label><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" onclick="load()" data-i="refresh_now"></button><button class="btn g" onclick="downloadJSON()">Export JSON</button><button class="btn g" onclick="downloadCSV()" data-i="exp_comments"></button><button class="btn g" onclick="downloadProducts()" data-i="exp_products"></button></div>
 <label>Info</label><div class="muted" id="info">-</div>
+</div></div><div class="card" style="margin-top:14px"><h2 data-i="acc_title"></h2><p class="small" style="color:#fcd34d" data-i="acc_warn"></p><div class="set">
+<label>TikTok</label><div class="tools" style="margin:0"><input id="ttuser" placeholder="@username" maxlength="25" autocomplete="off"><label class="small"><input type="checkbox" id="tton"> <span data-i="acc_on"></span></label><button class="btn" onclick="saveAcc('tiktok')" data-i="save"></button></div>
+<label data-i="acc_status"></label><div id="ttstatus" class="muted">-</div>
+<label>Shopee</label><div class="tools" style="margin:0"><input id="spuser" placeholder="username toko" maxlength="25" autocomplete="off"><button class="btn g" onclick="saveAcc('shopee')" data-i="save"></button></div>
+<label></label><div class="small muted" data-i="acc_shopee"></div>
 </div></div></section>
 </main>
 <footer data-i="footer"></footer>
@@ -288,7 +380,7 @@ vs_prev:'vs 12 jam sebelumnya',last12:'12 jam terakhir',nodata:'Belum ada data y
 k_viewers:'Penonton Live',k_eng:'Tingkat Engagement',k_intent:'Niat Beli',k_trust:'Sentimen Komentar Positif',k_comments:'Komentar (24j)',k_likes:'Likes (perkiraan)',k_gifts:'Gift',k_follows:'Follower Baru',
 c_comments:'Komentar',c_viewers:'Penonton',no_product:'Belum ada produk',spotlight:'produk paling disorot',see_product:'Lihat produk',no_mention:'Belum ada produk yang disebut.',
 th_product:'Produk',th_share:'Porsi Disebut',th_trust:'Dampak Trust',th_cat:'Kategori',th_price:'Harga',th_stock:'Stok',th_mentions:'Disebut',th_pos:'Sentimen +',
-t_cov:'Cakupan Penjelasan XAI',t_cov_sub:'{a} dari {b} interaksi',t_inter:'Interaksi Riset',t_survey:'Consumer Trust (Y) Kuesioner',t_likert:'skala Likert 1–5',t_sample:'Responden Valid',t_consent:'dengan persetujuan',sv_title:'Hasil Kuesioner (X · Y · Z)',sv_open:'Buka Kuesioner ↗',sv_csv:'Export CSV (SPSS/SmartPLS)',sv_empty:'Belum ada jawaban kuesioner.',sv_valid:'Responden Valid',sv_of:'{a} valid dari {b} isian',sv_out:'{n} tidak lolos penyaring',sv_need:'Butuh minimal 10 responden valid.',sv_sig:'indikatif signifikan',sv_ns:'belum signifikan',sv_hyp:'Uji Hipotesis (indikatif)',sv_path:'Jalur',sv_items:'Rata-rata per Item',sv_note:'Regresi OLS dengan X dan Z di-center (moderasi X×Z). |t| ≥ 1,96 ≈ signifikan 5% untuk sampel besar. Analisis final tetap di SPSS/SmartPLS sesuai arahan pembimbing. α ≥ 0,70 = reliabel.',sv_dummy:'Berisi jawaban DUMMY untuk uji tampilan — hapus sebelum pengumpulan data asli; jangan dipakai di BAB IV.',
+t_cov:'Cakupan Penjelasan XAI',t_cov_sub:'{a} dari {b} interaksi',t_inter:'Interaksi Riset',t_survey:'Consumer Trust (Y) Kuesioner',t_likert:'skala Likert 1–5',t_sample:'Responden Valid',t_consent:'dengan persetujuan',nav_copilot:'Copilot Live',cp_sub:'Draf jawaban & rekomendasi untuk host. Host yang memutuskan dan menyampaikan sendiri — tidak ada auto-comment.',cp_conn:'Status Connector TikTok',cp_readonly:'Hanya membaca (read-only): tidak login, tidak mengirim komentar/like/follow.',cp_ovl:'Overlay Live (OBS / TikTok LIVE Studio)',cp_ovl_help:'Tambahkan URL ini sebagai Browser Source (1920×1080). Latar transparan.',cp_hide:'Sembunyikan overlay',cp_queue:'Antrian Komentar Penting',cp_show:'Tampilkan di overlay',cp_showing:'Sedang tampil',cp_hidden:'Overlay tersembunyi',cp_empty:'Belum ada komentar yang perlu dijawab.',copy:'Salin',save:'Simpan',saved:'Tersimpan.',acc_title:'Akun Live',acc_warn:'⚠ Isi USERNAME saja. Jangan pernah memasukkan password atau kode OTP.',acc_on:'Aktifkan connector',acc_status:'Status',acc_shopee:'Membaca live Shopee belum didukung: butuh akses partner resmi Shopee Open Platform. Username hanya disimpan.',acc_bad:'Username tidak valid (2–24 huruf/angka/titik/garis bawah).',sv_title:'Hasil Kuesioner (X · Y · Z)',sv_open:'Buka Kuesioner ↗',sv_csv:'Export CSV (SPSS/SmartPLS)',sv_empty:'Belum ada jawaban kuesioner.',sv_valid:'Responden Valid',sv_of:'{a} valid dari {b} isian',sv_out:'{n} tidak lolos penyaring',sv_need:'Butuh minimal 10 responden valid.',sv_sig:'indikatif signifikan',sv_ns:'belum signifikan',sv_hyp:'Uji Hipotesis (indikatif)',sv_path:'Jalur',sv_items:'Rata-rata per Item',sv_note:'Regresi OLS dengan X dan Z di-center (moderasi X×Z). |t| ≥ 1,96 ≈ signifikan 5% untuk sampel besar. Analisis final tetap di SPSS/SmartPLS sesuai arahan pembimbing. α ≥ 0,70 = reliabel.',sv_dummy:'Berisi jawaban DUMMY untuk uji tampilan — hapus sebelum pengumpulan data asli; jangan dipakai di BAB IV.',
 no_match:'tidak ada kecocokan',score:'skor',no_inter:'Belum ada interaksi.',no_prod_match:'Tidak ada produk yang cocok.',no_comment_match:'Tidak ada komentar yang cocok.',connected:'Terhubung',api_down:'API tidak tersedia',
 info:'{e} event • {u} ID unik • {p} produk • {s} share • update {t}',has_dummy:'berisi data dummy',no_insight:'Belum ada data untuk membuat insight.',
 i_top:'<b>{n}</b> paling banyak disebut ({c}×). Sorot produk ini di awal sesi dan tampilkan alasan rekomendasinya secara jelas.',
@@ -310,7 +402,7 @@ vs_prev:'vs previous 12 hours',last12:'last 12 hours',nodata:'No data to analyze
 k_viewers:'Live Viewers',k_eng:'Engagement Rate',k_intent:'Purchase Intent',k_trust:'Positive Comment Sentiment',k_comments:'Comments (24h)',k_likes:'Likes (approx)',k_gifts:'Gift Events',k_follows:'New Follows',
 c_comments:'Comments',c_viewers:'Viewers',no_product:'No product yet',spotlight:'most highlighted product',see_product:'View products',no_mention:'No products mentioned yet.',
 th_product:'Product',th_share:'Mention Share',th_trust:'Trust Impact',th_cat:'Category',th_price:'Price',th_stock:'Stock',th_mentions:'Mentions',th_pos:'Sentiment +',
-t_cov:'XAI Explanation Coverage',t_cov_sub:'{a} of {b} interactions',t_inter:'Research Interactions',t_survey:'Consumer Trust (Y) Survey',t_likert:'Likert scale 1–5',t_sample:'Valid Respondents',t_consent:'with consent',sv_title:'Questionnaire Results (X · Y · Z)',sv_open:'Open Questionnaire ↗',sv_csv:'Export CSV (SPSS/SmartPLS)',sv_empty:'No questionnaire responses yet.',sv_valid:'Valid Respondents',sv_of:'{a} valid of {b} submissions',sv_out:'{n} screened out',sv_need:'Needs at least 10 valid respondents.',sv_sig:'indicatively significant',sv_ns:'not significant',sv_hyp:'Hypothesis Test (indicative)',sv_path:'Path',sv_items:'Mean per Item',sv_note:'OLS regression with mean-centered X and Z (X×Z moderation). |t| ≥ 1.96 ≈ 5% significance for large samples. Final analysis in SPSS/SmartPLS as directed by the supervisor. α ≥ 0.70 = reliable.',sv_dummy:'Contains DUMMY responses for display testing — delete before real data collection; do not use in Chapter IV.',
+t_cov:'XAI Explanation Coverage',t_cov_sub:'{a} of {b} interactions',t_inter:'Research Interactions',t_survey:'Consumer Trust (Y) Survey',t_likert:'Likert scale 1–5',t_sample:'Valid Respondents',t_consent:'with consent',nav_copilot:'Live Copilot',cp_sub:'Draft replies & recommendations for the host. The host decides and delivers them — no auto-comment.',cp_conn:'TikTok Connector Status',cp_readonly:'Read-only: no login, never sends comments/likes/follows.',cp_ovl:'Live Overlay (OBS / TikTok LIVE Studio)',cp_ovl_help:'Add this URL as a Browser Source (1920×1080). Transparent background.',cp_hide:'Hide overlay',cp_queue:'Important Comment Queue',cp_show:'Show on overlay',cp_showing:'Now showing',cp_hidden:'Overlay hidden',cp_empty:'No comments need a reply yet.',copy:'Copy',save:'Save',saved:'Saved.',acc_title:'Live Accounts',acc_warn:'⚠ Enter the USERNAME only. Never enter a password or OTP code.',acc_on:'Enable connector',acc_status:'Status',acc_shopee:'Reading Shopee live is not supported yet: requires official Shopee Open Platform partner access. Username is stored only.',acc_bad:'Invalid username (2–24 letters/digits/dot/underscore).',sv_title:'Questionnaire Results (X · Y · Z)',sv_open:'Open Questionnaire ↗',sv_csv:'Export CSV (SPSS/SmartPLS)',sv_empty:'No questionnaire responses yet.',sv_valid:'Valid Respondents',sv_of:'{a} valid of {b} submissions',sv_out:'{n} screened out',sv_need:'Needs at least 10 valid respondents.',sv_sig:'indicatively significant',sv_ns:'not significant',sv_hyp:'Hypothesis Test (indicative)',sv_path:'Path',sv_items:'Mean per Item',sv_note:'OLS regression with mean-centered X and Z (X×Z moderation). |t| ≥ 1.96 ≈ 5% significance for large samples. Final analysis in SPSS/SmartPLS as directed by the supervisor. α ≥ 0.70 = reliable.',sv_dummy:'Contains DUMMY responses for display testing — delete before real data collection; do not use in Chapter IV.',
 no_match:'no match',score:'score',no_inter:'No interactions yet.',no_prod_match:'No matching products.',no_comment_match:'No matching comments.',connected:'Connected',api_down:'API unavailable',
 info:'{e} events • {u} unique IDs • {p} products • {s} shares • updated {t}',has_dummy:'contains dummy data',no_insight:'Not enough data for insights yet.',
 i_top:'<b>{n}</b> is the most mentioned product ({c}×). Feature it early in the session and show its recommendation reasons clearly.',
@@ -391,10 +483,24 @@ r.sort((a,b)=>k=='name'?a.name.localeCompare(b.name):k=='price'?(b.price||0)-(a.
 $('ptable').innerHTML=r.length?`<table><thead><tr><th>${t('th_product')}</th><th>${t('th_cat')}</th><th>${t('th_price')}</th><th>${t('th_stock')}</th><th>${t('th_mentions')}</th><th>${t('question')}</th><th>${t('th_pos')}</th></tr></thead><tbody>`+r.map(p=>{const t=p.pos+p.neg?Math.round(p.pos/(p.pos+p.neg)*100):null;return `<tr><td><div class="pname">${thumb(p.name,36)}<div><b>${esc(p.name)}</b><small>${esc(String(p.description||'').replace('[DUMMY] ',''))}</small></div></div></td><td>${esc(p.category)}</td><td>${rp(p.price)}</td><td>${esc(p.stock)}</td><td>${p.mentions} <span class="muted small">(${pct(p.mentions,tot).toFixed(1)}%)</span></td><td>${p.questions}</td><td>${t==null?'–':`<span class="gpill ${t<50?'n':''}">${t}%</span>`}</td></tr>`}).join('')+'</tbody></table>':`<p class="empty">${t('no_prod_match')}</p>`}
 function renderFeed(){if(!latest)return;let q=$('filter').value.toLowerCase(),plat=$('platformFilter').value,sf=$('sentFilter').value;let items=(latest.recent_comments||[]).filter(c=>(!q||c.comment.toLowerCase().includes(q)||String(c.user).toLowerCase().includes(q))&&(!plat||c.platform==plat)&&(!sf||c.sentiment==sf));
 $('feed').innerHTML=items.map(c=>`<div class="comment"><span class="s ${c.sentiment}"></span><b>${esc(c.user)}</b> <span class="muted small">${esc(c.platform)}${c.region?' · '+esc(c.region):''} · ${new Date(c.time).toLocaleString(LOC())}</span><div>${esc(c.comment)}</div></div>`).join('')||`<p class="empty">${t('no_comment_match')}</p>`}
-async function load(){try{let r=await fetch(API);if(!r.ok)throw 0;let d=await r.json();if(d.error)throw 0;latest=d;lastOk=new Date();render(d);setStatus()}catch(e){lastOk=null;setStatus()}}
+const post=(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'liveai'},body:JSON.stringify(b)}).then(r=>{if(!r.ok)throw new Error(r.status);return r.json()});
+function copyText(t){try{navigator.clipboard.writeText(t)}catch(e){}}
+const ST={connected:'#4ade80',waiting:'#fcd34d',checking:'#93c5fd',ended:'#a4a3c9',idle:'#a4a3c9',error:'#fb7185'};
+function stat(s){if(!s||!s.state)return '-';return `<span class="s" style="background:${ST[s.state]||'#999'}"></span>${esc(s.detail||s.state)}${s.events?` · ${fmt(s.events)} event`:''}`}
+let CP=[];async function loadLive(){try{const [c,items,ov]=await Promise.all([fetch('api/live/config').then(r=>r.json()),fetch('api/copilot').then(r=>r.json()),fetch('api/overlay').then(r=>r.json())]);
+if(document.activeElement!==$('ttuser'))$('ttuser').value=c.tiktok?.username?'@'+c.tiktok.username:'';$('tton').checked=!!c.tiktok?.enabled;if(document.activeElement!==$('spuser'))$('spuser').value=c.shopee?.username||'';
+$('ttstatus').innerHTML=stat(c.tiktok_status);$('cpstatus').innerHTML=stat(c.tiktok_status);$('ovlurl').value=location.origin+location.pathname.replace(/\/$/,'')+'/overlay';
+$('ovlnow').innerHTML=ov.visible?`${t('cp_showing')}: <b>${esc(ov.product?.name)}</b>`:t('cp_hidden');CP=items;
+$('cplist').innerHTML=items.map((x,i)=>`<div class="comment"><span class="chip">${esc(x.intent)}</span> <b>${esc(x.user)}</b> <span class="muted small">${esc(x.platform)} · ${new Date(x.time).toLocaleTimeString(LOC())}</span><div>💬 ${esc(x.comment)}</div>
+<textarea id="dr${i}" rows="2" style="width:100%;margin-top:6px;background:#0d0a24;color:var(--txt);border:1px solid var(--line);border-radius:9px;padding:8px">${esc(x.draft)}</textarea>
+<div class="tools" style="margin:6px 0 0"><button class="btn g" onclick="copyText($('dr${i}').value)">${t('copy')}</button>${x.product?`<button class="btn" onclick="showOverlay(${i})">${t('cp_show')}</button>`:''}</div></div>`).join('')||`<p class="empty">${t('cp_empty')}</p>`}catch(e){}}
+async function saveAcc(p){try{await post('api/live/config',p=='tiktok'?{platform:p,username:$('ttuser').value,enabled:$('tton').checked}:{platform:p,username:$('spuser').value,enabled:false});loadLive();alert(t('saved'))}catch(e){alert(t('acc_bad'))}}
+async function showOverlay(i){const x=CP[i];await post('api/overlay',{visible:true,product:x.product,reasons:x.reasons});loadLive()}
+async function hideOverlay(){await post('api/overlay',{visible:false});loadLive()}
+async function load(){loadLive();try{let r=await fetch(API);if(!r.ok)throw 0;let d=await r.json();if(d.error)throw 0;latest=d;lastOk=new Date();render(d);setStatus()}catch(e){lastOk=null;setStatus()}}
 let lastOk=null,loaded=false;function setStatus(){const s=$('status');if(lastOk){s.className='pill ok';s.innerHTML=`<span class="dot"></span>${t('connected')} · ${lastOk.toLocaleTimeString(LOC(),{hour:'2-digit',minute:'2-digit'})}`}else{s.className='pill bad';s.innerHTML=`<span class="dot"></span>${t('api_down')}`}}
 const LOC=()=>LANG=='en'?'en-GB':'id-ID';
-const VIEWS=['overview','live','products','insights','research','settings'];function go(v){location.hash=v}
+const VIEWS=['overview','live','products','insights','copilot','research','settings'];function go(v){location.hash=v}
 function show(){let v=location.hash.slice(1);if(!VIEWS.includes(v))v=SET.home||'overview';VIEWS.forEach(x=>$('v-'+x).classList.toggle('on',x==v));document.querySelectorAll('#menu a[data-v]').forEach(a=>a.classList.toggle('on',a.dataset.v==v));closeDD();window.scrollTo(0,0)}
 function toggleDD(e){e.stopPropagation();const dd=$('dd'),b=dd.querySelector('button').getBoundingClientRect(),l=dd.querySelector('.list');dd.classList.toggle('open');l.style.top=(b.bottom+4)+'px';l.style.left=Math.min(b.left,window.innerWidth-200)+'px'}function closeDD(){$('dd').classList.remove('open')}document.addEventListener('click',closeDD);window.addEventListener('scroll',closeDD);
 function openSurvey(){window.open(location.protocol+'//'+location.hostname+':'+(SET.port||18080)+'/survey','_blank','noopener')}
