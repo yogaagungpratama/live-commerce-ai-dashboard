@@ -2,6 +2,8 @@
 
 Dashboard analitik *live commerce* bertema ungu: penonton, engagement, komentar, produk paling dicari, sentimen, insight AI berbasis aturan, dan monitor riset (kuesioner X/Y/Z). Antarmuka dua bahasa (ID/EN).
 
+**Demo publik (data dummy):** https://yogaagungpratama.github.io/live-commerce-ai-dashboard/
+
 *Purple-themed live commerce analytics dashboard: viewers, engagement, comments, top products, sentiment, rule-based AI insights, and a research monitor. Bilingual UI (ID/EN).*
 
 ## Fitur
@@ -41,3 +43,6 @@ db/schema.sql         skema tabel
 scripts/seed_dummy.py data demo
 compose.yaml          dashboard + PostgreSQL
 ```
+
+## Demo statis
+Folder `docs/` berisi versi statis dashboard dengan snapshot data dummy (`docs/data.json`) untuk GitHub Pages. Tidak terhubung ke server/database.
